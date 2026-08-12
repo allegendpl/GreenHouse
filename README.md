@@ -1,3 +1,40 @@
+# GreenHouse
+
+Can help farmers determine specifically what the type of damage is, and if this was an app it could then offer some solutions (i.e. which pesticide brand to buy)
+
+The repo currently holds two independent classifiers, one per crop. They do not
+share code or dependencies yet — pick the one you want to run.
+
+| Track | Crop | Approach | Entry point |
+|---|---|---|---|
+| **Tomato** | *Solanum lycopersicum* | Keras CNN, 10-class disease ID | `streamlit run app/app.py` |
+| **Bell pepper** | *Capsicum annuum* | scikit-learn + scikit-image, binary healthy/damaged | `streamlit run app.py` |
+
+---
+
+# 🍅 Tomato Leaf Disease Classifier
+
+A 10-class Keras CNN trained on a tomato-leaf dataset at 224×224, covering:
+
+`Bacterial_spot`, `Early_blight`, `Late_blight`, `Leaf_Mold`,
+`Septoria_leaf_spot`, `Spider_mites`, `Target_Spot`,
+`Tomato_Yellow_Leaf_Curl_Virus`, `Tomato_mosaic_virus`, `healthy`
+
+| File | Purpose |
+|---|---|
+| `notebooks/plant_damage_classifier.ipynb` | Colab training notebook |
+| `app/tomato_model.keras` | Trained model loaded by the app |
+| `app/app.py` | Streamlit UI — upload a leaf, get top-3 predictions |
+
+```bash
+streamlit run app/app.py
+```
+
+Requires `tensorflow`, `streamlit`, `pillow`, `numpy`. Note this track is *not*
+covered by the root `requirements.txt`, which is pepper-only.
+
+---
+
 # 🌿 Bell Pepper Leaf Damage Identifier
 
 A baseline **binary classifier** (Healthy vs. Damaged) for bell pepper
