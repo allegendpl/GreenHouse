@@ -1,0 +1,21 @@
+# Local-only Streamlit configuration.
+# Keeps the app a plain local web app: no Deploy button, no cloud prompts,
+# no usage telemetry, no tunnel.
+
+[theme]
+base = "dark"
+primaryColor = "#1a7f37"
+
+[client]
+# Hides the "Deploy" button and trims the hamburger menu to essentials.
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# Bind to loopback only — the app is not reachable from other machines.
+address = "127.0.0.1"
+port = 8501
+headless = true
