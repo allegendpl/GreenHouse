@@ -139,6 +139,17 @@ def describe_pepper(bundle) -> list:
             f"Verdict stable on {stability:.0%} of leaves under rotation, "
             f"exposure and colour shifts"
         )
+
+    after = bundle.get("confidence", {}).get("after")
+    if after:
+        # Worth stating plainly: the displayed percentage is a calibrated
+        # probability, so "90%" means right about 90% of the time — not a raw
+        # tree-vote share, which reads far lower than the model's real accuracy.
+        lines.append(
+            f"Confidence is calibrated — reads true within "
+            f"{abs(after['calibration_gap']):.1%} of actual accuracy"
+        )
+
     lines.append("Classes: " + ", ".join(bundle.get("class_names", [])))
     return lines
 
@@ -152,18 +163,35 @@ def load_tomato_model(model_path: str, mtime: float):
     """
     Load and cache the tomato Keras model.
 
-    TensorFlow is imported here rather than at module scope on purpose: it is a
-    heavy optional dependency that is not in requirements.txt, and importing it
-    up top would break the pepper half of this app for anyone who has not
-    installed it.
+    The deep-learning stack is imported here rather than at module scope on
+    purpose: it is a heavy optional dependency, and importing it up top would
+    break the pepper half of this app for anyone who has not installed it.
+
+    Standalone Keras 3 is preferred over ``tensorflow.keras``. The saved model is
+    Keras 3 format, which is backend-agnostic, and TensorFlow publishes no wheels
+    for Python 3.14 — so on a current interpreter TF cannot be installed at all,
+    while Keras on JAX loads the very same file. ``tensorflow.keras`` remains as
+    a fallback for environments that already have TF.
     """
+    keras = None
     try:
-        from tensorflow import keras
-    except ImportError as exc:  # noqa: BLE001 - surfaced to the user as guidance
+        # Must be set before the first `import keras` — the backend is resolved
+        # at import time. setdefault so an explicit KERAS_BACKEND still wins.
+        os.environ.setdefault("KERAS_BACKEND", "jax")
+        import keras  # noqa: F811
+    except ImportError:
+        try:
+            from tensorflow import keras  # noqa: F811
+        except ImportError:
+            keras = None
+
+    if keras is None:
         raise ImportError(
-            "TensorFlow is required for the tomato model but is not installed. "
-            "The bell pepper model does not need it."
-        ) from exc
+            "The tomato model needs Keras 3 with a backend. Install Keras and "
+            "JAX — TensorFlow has no wheels for Python 3.14, but the saved model "
+            "is backend-agnostic and loads fine on JAX. The bell pepper model "
+            "needs none of this."
+        )
 
     return keras.models.load_model(model_path)
 
@@ -317,7 +345,7 @@ def show_model_problem(crop_name: str, crop: dict, model_path: str, error) -> No
     st.error(f"Found `{model_path}`, but it could not be loaded.")
     st.markdown(str(error))
     if isinstance(error, ImportError):
-        st.markdown("```bash\npip install tensorflow\n```")
+        st.markdown("```bash\npip install keras jax jaxlib\n```")
 
 
 def render_sidebar() -> tuple:

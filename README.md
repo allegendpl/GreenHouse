@@ -37,14 +37,25 @@ A 10-class Keras CNN trained on a tomato-leaf dataset at 224×224, covering:
 | `notebooks/plant_damage_classifier.ipynb` | Colab training notebook |
 | `app/tomato_model.keras` | Trained model loaded by the app |
 
-Select **Tomato** in the sidebar of `app.py`. This half needs TensorFlow, which
-is deliberately **not** in `requirements.txt` — it is a very large dependency and
-the pepper half does not need it. `app.py` imports it lazily and shows an install
-prompt if you pick Tomato without it:
+Select **Tomato** in the sidebar of `app.py`. This half needs a deep-learning
+runtime, deliberately **not** in `requirements.txt` — it is large and the pepper
+half does not need it. `app.py` imports it lazily and shows an install prompt if
+you pick Tomato without it:
 
 ```bash
-pip install tensorflow
+pip install keras jax jaxlib
 ```
+
+**Use Keras + JAX, not TensorFlow.** `pip install tensorflow` fails on this
+project's interpreter with `No matching distribution found` — TensorFlow
+publishes no wheels for Python 3.14. That is not a broken install: there is
+simply nothing to download.
+
+It doesn't matter, because `tomato_model.keras` was saved by **Keras 3.13** in
+the backend-agnostic `.keras` format. Keras 3 runs on JAX, PyTorch or
+TensorFlow and loads the identical file either way, so JAX (which *does* ship
+3.14 wheels) is a drop-in substitute. `app.py` prefers standalone Keras and sets
+`KERAS_BACKEND=jax`, falling back to `tensorflow.keras` if you already have TF.
 
 ---
 

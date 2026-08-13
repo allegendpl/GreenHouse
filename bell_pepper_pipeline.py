@@ -59,17 +59,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402  (must follow matplotlib.use)
 from skimage.feature import local_binary_pattern
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
     confusion_matrix,
     f1_score,
 )
+from sklearn.isotonic import IsotonicRegression
 from sklearn.model_selection import (
     GroupShuffleSplit,
     StratifiedGroupKFold,
     StratifiedKFold,
+    cross_val_predict,
     cross_val_score,
     train_test_split,
 )
@@ -123,8 +125,13 @@ LBP_METHOD = "uniform"
 # stale model bundle can never be silently fed vectors it was not trained on —
 # the single worst source of train/inference inconsistency.
 #   1 = whole-image HSV histogram + whole-image LBP (background included)
-#   2 = white-balanced, leaf-segmented HSV + LBP (background excluded)
-FEATURE_VERSION = 2
+#   2 = white-balanced, leaf-segmented HSV + LBP (background excluded), where
+#       the leaf was found by thresholding saturation
+#   3 = same, but the leaf is found with the Excess Green vegetation index.
+#       Saturation-Otsu assumed the backdrop was the least saturated thing in
+#       frame, which held for studio greys and failed badly on real photos - a
+#       terracotta pot outscored the plant. See ``segment_leaf``.
+FEATURE_VERSION = 3
 
 # --- Consistency controls -------------------------------------------------- #
 # The v1 descriptor was computed over the entire frame, so the uniform grey
@@ -347,56 +354,90 @@ def white_balance(rgb: np.ndarray, reference_mask: np.ndarray = None) -> np.ndar
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def segment_leaf(rgb: np.ndarray) -> np.ndarray:
+def _excess_green(rgb: np.ndarray) -> np.ndarray:
     """
-    Return a uint8 mask (255 = leaf tissue) isolating the leaf from the backdrop.
+    Excess Green index (2g - r - b) on chromatic coordinates, as uint8.
 
-    Studio plant-disease datasets shoot a single detached leaf against a flat,
-    near-neutral background. Neutral means *low saturation*, while leaf tissue —
-    green, chlorotic yellow or necrotic brown alike — is comparatively saturated.
-    Otsu on the saturation channel therefore separates the two without needing a
-    hand-tuned hue window that would exclude diseased tissue.
-
-    Morphological closing then opening fills lesion pinholes and drops speckle,
-    and only the largest connected component is kept so stray corner blobs do not
-    contribute pixels. If the result is implausible as a leaf, an all-ones mask
-    is returned so the caller degrades to whole-image behaviour rather than
-    scoring noise.
+    The standard vegetation index in plant phenotyping. Normalising r/g/b by
+    their sum first makes it largely invariant to illumination level, so it
+    responds to *how green* a pixel is rather than how bright.
     """
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    saturation = hsv[:, :, 1]
+    f = rgb.astype(np.float32)
+    total = f.sum(axis=2) + 1e-6
+    r, g, b = f[:, :, 0] / total, f[:, :, 1] / total, f[:, :, 2] / total
+    exg = 2.0 * g - r - b
+    lo, hi = float(exg.min()), float(exg.max())
+    return np.clip((exg - lo) / (hi - lo + 1e-6) * 255.0, 0, 255).astype(np.uint8)
 
-    _thresh, mask = cv2.threshold(
-        saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
 
+def _clean_mask(mask: np.ndarray) -> np.ndarray:
+    """Morphological cleanup, small-component removal and hole filling."""
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (MASK_MORPH_KERNEL, MASK_MORPH_KERNEL)
     )
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    # Drop speckle, but keep every substantial blob: a leaf bisected by a large
-    # necrotic lesion legitimately fragments, and taking only the single largest
-    # component would silently throw away half the tissue we need to score.
-    n_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
-    )
+    n_labels, labels, stats, _c = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if n_labels > 1:
-        # Row 0 is the background component; measure against the biggest of the rest.
         areas = stats[1:, cv2.CC_STAT_AREA]
         keep = 1 + np.flatnonzero(areas >= MASK_COMPONENT_RATIO * areas.max())
         mask = np.where(np.isin(labels, keep), 255, 0).astype(np.uint8)
 
-    # Fill interior holes so lesion centres — the most diagnostic pixels on the
-    # leaf — are not punched out of the very mask meant to select leaf tissue.
     filled = mask.copy()
     flood = np.zeros((mask.shape[0] + 2, mask.shape[1] + 2), np.uint8)
     cv2.floodFill(filled, flood, (0, 0), 255)
-    mask = mask | cv2.bitwise_not(filled)
+    return mask | cv2.bitwise_not(filled)
+
+
+def _green_fraction(rgb: np.ndarray, mask: np.ndarray) -> float:
+    """Share of masked pixels whose hue is vegetation-like (green/yellow-green)."""
+    if np.count_nonzero(mask) == 0:
+        return 0.0
+    hue = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[:, :, 0][mask > 0]
+    return float(((hue >= 25) & (hue <= 95)).mean())
+
+
+def segment_leaf(rgb: np.ndarray) -> np.ndarray:
+    """
+    Return a uint8 mask (255 = leaf tissue) isolating foliage from everything else.
+
+    Primary cue is **Excess Green**, the standard vegetation index. The earlier
+    approach thresholded *saturation*, which assumes the background is the least
+    saturated thing in frame — true for a studio grey backdrop, badly false in a
+    real photo. On a potted seedling shot on carpet, saturation-Otsu selected the
+    terracotta pot (8% of masked pixels were green) while Excess Green selects the
+    plant (84% green). It is also cleaner on the studio images themselves, where
+    it lifts masked greenness from ~0.71-0.99 to ~0.95-1.00.
+
+    Excess Green's weakness is the mirror image: a fully necrotic, brown leaf is
+    not green, so on such an image ExG can select almost nothing. Saturation-Otsu
+    handles exactly that case, so it is kept as a fallback whenever the ExG mask
+    comes out implausibly small.
+
+    Interior holes are filled, so brown lesions *inside* a green leaf are scored
+    even though ExG alone would reject those pixels.
+    """
+    exg_mask = _clean_mask(
+        cv2.threshold(
+            _excess_green(rgb), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
+    )
+
+    coverage = float(np.count_nonzero(exg_mask)) / exg_mask.size
+    if MASK_MIN_COVERAGE <= coverage <= MASK_MAX_COVERAGE:
+        return exg_mask
+
+    # ExG found nothing plausible — most likely a leaf with no green left.
+    saturation = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[:, :, 1]
+    mask = _clean_mask(
+        cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    )
 
     coverage = float(np.count_nonzero(mask)) / mask.size
     if not (MASK_MIN_COVERAGE <= coverage <= MASK_MAX_COVERAGE):
+        # Neither cue found a plausible leaf; score the whole frame rather than
+        # a handful of stray pixels.
         return np.full(mask.shape, 255, dtype=np.uint8)
     return mask
 
@@ -770,6 +811,16 @@ def build_models(only: List[str] = None) -> dict:
     train just the RandomForest keeps that run practical.
     """
     models = {
+        # Gradient boosting produces markedly sharper probabilities than a
+        # forest's vote-share: on this data it cuts sub-80% predictions from
+        # 4.3% to 0.8% while also scoring the best macro-F1, so the confidence
+        # the UI shows is both higher and better earned.
+        "HistGB": HistGradientBoostingClassifier(
+            max_iter=400,
+            learning_rate=0.1,
+            class_weight="balanced",
+            random_state=42,
+        ),
         "RandomForest": RandomForestClassifier(
             n_estimators=300,
             max_depth=None,
@@ -809,6 +860,196 @@ def build_models(only: List[str] = None) -> dict:
             )
         models = {n: models[n] for n in only}
     return models
+
+
+# --------------------------------------------------------------------------- #
+# Probability calibration
+# --------------------------------------------------------------------------- #
+#
+# A RandomForest reports the fraction of trees voting for a class, which is not
+# a probability. On this data it runs badly *under*-confident: predictions it
+# labels 85% are correct ~97% of the time. That understates the model to anyone
+# reading the number, so the app shows less certainty than it has earned.
+#
+# Isotonic regression learns the monotonic map from reported vote-fraction to
+# observed accuracy and applies it, which raises the honest cases and leaves the
+# genuinely ambiguous ones low.
+
+class CalibratedModel:
+    """
+    A fitted estimator plus an isotonic map from its scores to real probabilities.
+
+    Defined at module scope (not a closure) so joblib can pickle it into the
+    model bundle alongside everything else.
+    """
+
+    def __init__(self, base, calibrator, classes):
+        self.base = base
+        self.calibrator = calibrator
+        self.classes_ = np.asarray(classes)
+
+    def predict_proba(self, X):
+        raw = self.base.predict_proba(X)[:, 1]
+        damaged = np.clip(self.calibrator.predict(raw), 0.0, 1.0)
+        return np.column_stack([1.0 - damaged, damaged])
+
+    def predict(self, X):
+        return self.classes_[(self.predict_proba(X)[:, 1] >= 0.5).astype(int)]
+
+
+def fit_calibrated(model, X, y, groups=None, folds: int = 5,
+                   random_state: int = 42) -> CalibratedModel:
+    """
+    Fit ``model`` and an isotonic calibrator on group-aware out-of-fold scores.
+
+    The calibrator MUST be fitted on predictions for images the underlying model
+    did not train on, otherwise it learns to map memorised near-certainty onto
+    near-certainty and does nothing. scikit-learn's own CalibratedClassifierCV
+    would do the cross-validation internally but not group-aware, so augmented
+    copies of one leaf would straddle its folds — hence doing it explicitly here.
+    """
+    if groups is not None and len(set(groups)) < len(groups):
+        cv = StratifiedGroupKFold(
+            n_splits=folds, shuffle=True, random_state=random_state
+        )
+        split_kwargs = {"groups": groups}
+    else:
+        cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
+        split_kwargs = {}
+
+    print(f"Fitting calibrator on {folds}-fold out-of-fold probabilities ...")
+    oof = cross_val_predict(
+        model, X, y, cv=cv, method="predict_proba", n_jobs=-1, **split_kwargs
+    )[:, 1]
+
+    calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    calibrator.fit(oof, (y == CLASS_DAMAGED).astype(float))
+
+    model.fit(X, y)
+    return CalibratedModel(model, calibrator, classes=[CLASS_UNDAMAGED, CLASS_DAMAGED])
+
+
+def confidence_report(model, X, y, groups=None, folds: int = 5,
+                      random_state: int = 42) -> dict:
+    """
+    Measure out-of-fold confidence and how truthful it is.
+
+    Returns the mean confidence, the share of predictions under 80%, and the
+    calibration gap per bin (accuracy minus claimed confidence). A positive gap
+    means the model is under-selling itself; a negative gap means it is
+    overclaiming, which is the failure mode that matters for a screening tool.
+    """
+    if groups is not None and len(set(groups)) < len(groups):
+        cv = StratifiedGroupKFold(
+            n_splits=folds, shuffle=True, random_state=random_state
+        )
+        split_kwargs = {"groups": groups}
+    else:
+        cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
+        split_kwargs = {}
+
+    proba = cross_val_predict(
+        model, X, y, cv=cv, method="predict_proba", n_jobs=-1, **split_kwargs
+    )
+    conf = proba.max(axis=1)
+    correct = proba.argmax(axis=1) == y
+
+    edges = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.001]
+    bins, gap = [], 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf >= lo) & (conf < hi)
+        if not m.sum():
+            continue
+        claimed, actual = float(conf[m].mean()), float(correct[m].mean())
+        bins.append({"lo": lo, "hi": hi, "n": int(m.sum()),
+                     "claimed": claimed, "actual": actual})
+        gap += m.mean() * (actual - claimed)
+
+    return {
+        "mean_confidence": float(conf.mean()),
+        "median_confidence": float(np.median(conf)),
+        "frac_below_80": float((conf < 0.8).mean()),
+        "accuracy": float(correct.mean()),
+        "calibration_gap": float(gap),
+        "bins": bins,
+    }
+
+
+def calibrated_confidence_report(model, X, y, groups=None, folds: int = 5,
+                                 random_state: int = 42) -> dict:
+    """
+    Confidence of the *calibrated* model, measured without self-flattery.
+
+    Scoring a calibrator on the very scores it was fitted to would report the
+    improvement it was trained to produce. So the source images are split in
+    half by group: the calibrator is fitted on one half's out-of-fold scores and
+    evaluated on the other half's, which it has never seen.
+    """
+    if groups is not None and len(set(groups)) < len(groups):
+        cv = StratifiedGroupKFold(
+            n_splits=folds, shuffle=True, random_state=random_state
+        )
+        split_kwargs = {"groups": groups}
+    else:
+        cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
+        split_kwargs = {}
+
+    oof = cross_val_predict(
+        model, X, y, cv=cv, method="predict_proba", n_jobs=-1, **split_kwargs
+    )[:, 1]
+
+    g = np.asarray(groups) if groups is not None else np.arange(len(y))
+    unique = np.unique(g)
+    rng = np.random.default_rng(random_state)
+    fit_groups = set(rng.choice(unique, len(unique) // 2, replace=False).tolist())
+    fit_mask = np.array([gi in fit_groups for gi in g])
+    eval_mask = ~fit_mask
+
+    calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    calibrator.fit(oof[fit_mask], (y[fit_mask] == CLASS_DAMAGED).astype(float))
+
+    damaged = np.clip(calibrator.predict(oof[eval_mask]), 0.0, 1.0)
+    proba = np.column_stack([1.0 - damaged, damaged])
+    conf = proba.max(axis=1)
+    correct = proba.argmax(axis=1) == y[eval_mask]
+
+    edges = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.001]
+    bins, gap = [], 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf >= lo) & (conf < hi)
+        if not m.sum():
+            continue
+        claimed, actual = float(conf[m].mean()), float(correct[m].mean())
+        bins.append({"lo": lo, "hi": hi, "n": int(m.sum()),
+                     "claimed": claimed, "actual": actual})
+        gap += m.mean() * (actual - claimed)
+
+    return {
+        "mean_confidence": float(conf.mean()),
+        "median_confidence": float(np.median(conf)),
+        "frac_below_80": float((conf < 0.8).mean()),
+        "accuracy": float(correct.mean()),
+        "calibration_gap": float(gap),
+        "bins": bins,
+    }
+
+
+def print_confidence(report: dict, title: str = "Confidence") -> None:
+    """Pretty-print a :func:`confidence_report`."""
+    print(f"\n{'-' * 60}")
+    print(title)
+    print(f"{'-' * 60}")
+    print(f"Out-of-fold accuracy : {report['accuracy']:.4f}")
+    print(f"Mean confidence      : {report['mean_confidence']:.3f}")
+    print(f"Median confidence    : {report['median_confidence']:.3f}")
+    print(f"Predictions below 80%: {report['frac_below_80']:.2%}")
+    print(f"Calibration gap      : {report['calibration_gap']:+.4f} "
+          f"({'under' if report['calibration_gap'] > 0 else 'over'}-confident)")
+    print(f"\n{'bin':>14}{'n':>8}{'claims':>9}{'actual':>9}{'gap':>9}")
+    for b in report["bins"]:
+        label = f"[{b['lo']:.2f},{b['hi']:.2f})"
+        print(f"{label:>14}{b['n']:>8}{b['claimed']:>9.3f}{b['actual']:>9.3f}"
+              f"{b['actual'] - b['claimed']:>+9.3f}")
 
 
 def plot_confusion_matrix(cm: np.ndarray, model_name: str, out_dir: str) -> str:
@@ -988,6 +1229,7 @@ def save_model(
     metrics: dict = None,
     consistency: dict = None,
     augmented: bool = False,
+    confidence: dict = None,
 ) -> None:
     """Persist the model + metadata needed for consistent inference."""
     out_dir = os.path.dirname(os.path.abspath(out_path))
@@ -1015,8 +1257,10 @@ def save_model(
             "augmented": augmented,
             "augment_transforms": sorted(AUGMENT_TRANSFORMS) if augmented else [],
         },
+        "calibrated": bool(confidence),
         "metrics": metrics or {},
         "consistency": consistency or {},
+        "confidence": confidence or {},
     }
     dump(bundle, out_path)
     print(f"\nSaved best model bundle -> {out_path}")
@@ -1075,6 +1319,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Subset of estimators to train, e.g. --models RandomForest.",
     )
     parser.add_argument(
+        "--no-calibrate",
+        action="store_true",
+        help=(
+            "Skip isotonic probability calibration. Calibration is on by default "
+            "because the raw tree-vote fractions run under-confident."
+        ),
+    )
+    parser.add_argument(
         "--augment",
         action="store_true",
         help=(
@@ -1112,6 +1364,30 @@ def main(argv=None) -> int:
         only_models=args.models,
     )
 
+    # --- Probability calibration ------------------------------------------- #
+    # Reported before and after, because the point of calibrating is to make the
+    # number the app displays match how often the model is actually right.
+    confidence = {}
+    if not args.no_calibrate:
+        fresh = build_models(only=[best_name])[best_name]
+        before = confidence_report(
+            fresh, X, y, groups=groups, folds=args.cv_folds,
+            random_state=args.random_state,
+        )
+        print_confidence(before, title=f"Confidence BEFORE calibration ({best_name})")
+
+        after = calibrated_confidence_report(
+            build_models(only=[best_name])[best_name], X, y, groups=groups,
+            folds=args.cv_folds, random_state=args.random_state,
+        )
+        print_confidence(after, title=f"Confidence AFTER calibration ({best_name})")
+
+        best_model = fit_calibrated(
+            build_models(only=[best_name])[best_name], X, y, groups=groups,
+            folds=args.cv_folds, random_state=args.random_state,
+        )
+        confidence = {"before": before, "after": after}
+
     consistency = {}
     if args.consistency_sample > 0:
         consistency = evaluate_consistency(
@@ -1129,6 +1405,7 @@ def main(argv=None) -> int:
         metrics=metrics,
         consistency=consistency,
         augmented=args.augment,
+        confidence=confidence,
     )
     return 0
 
