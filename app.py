@@ -136,13 +136,31 @@ def render_sidebar() -> tuple:
     if not os.path.isfile(model_path):
         return model_path, None
 
-    bundle = get_bundle(model_path, os.path.getmtime(model_path))
+    try:
+        bundle = get_bundle(model_path, os.path.getmtime(model_path))
+    except ValueError as exc:
+        # Raised when the bundle's descriptor version predates this code. Show
+        # the retrain instruction rather than a raw traceback.
+        st.sidebar.error(str(exc))
+        return model_path, None
+
     st.sidebar.success(f"Loaded: {bundle.get('model_name', 'unknown')}")
     cfg = bundle.get("feature_config", {})
     if cfg:
         st.sidebar.caption(
             f"Input size {cfg.get('img_size')} · HSV bins {cfg.get('hsv_bins')} "
             f"· LBP P={cfg.get('lbp_points')}, R={cfg.get('lbp_radius')}"
+        )
+        if cfg.get("segment_leaf"):
+            st.sidebar.caption(
+                "Background removed before scoring · white-balanced · "
+                "exposure-normalised"
+            )
+    stability = bundle.get("consistency", {}).get("stable_fraction")
+    if stability is not None:
+        st.sidebar.caption(
+            f"Verdict stable on {stability:.0%} of leaves under rotation, "
+            f"exposure and colour shifts"
         )
     st.sidebar.caption("Classes: " + ", ".join(bundle.get("class_names", CLASS_NAMES)))
     return model_path, bundle

@@ -37,14 +37,20 @@ covered by the root `requirements.txt`, which is pepper-only.
 
 # 🌿 Bell Pepper Leaf Damage Identifier
 
-A baseline **binary classifier** (Healthy vs. Damaged) for bell pepper
-(*Capsicum annuum*) leaves, built with classic computer vision — no deep
-learning. Uses **scikit-image** for feature extraction and **scikit-learn** for
-classification, with a **Streamlit** UI for testing single images.
+A **binary classifier** (Healthy vs. Damaged) for bell pepper (*Capsicum
+annuum*) leaves, built with classic computer vision — no deep learning. Uses
+**scikit-image** for feature extraction and **scikit-learn** for classification,
+with a **Streamlit** UI for testing single images.
+
+The pipeline optimises for **consistency**, not just accuracy: the leaf is
+segmented from its background before any feature is computed, lighting and
+colour are normalised, and the model is scored on whether it holds the same
+verdict when the same leaf is rephotographed differently. See
+[Measured results](#measured-results) for what that bought — and what it cost.
 
 | File | Purpose |
 |---|---|
-| `bell_pepper_pipeline.py` | Dataset parsing, feature extraction, training, evaluation |
+| `bell_pepper_pipeline.py` | Dataset parsing, preprocessing, feature extraction, training, evaluation, consistency harness |
 | `predict_pepper.py` | CLI inference on one image |
 | `app.py` | Streamlit web UI (drag-and-drop testing) |
 | `LABELS.md` | Shared labeling standard for the team |
@@ -144,11 +150,30 @@ condition slug isn't in the `LABELS.md` vocabulary (catches typos like
 python bell_pepper_pipeline.py --data-dir data
 ```
 
-Trains a `RandomForestClassifier` and an `SVC`, prints a `classification_report`
-plus confusion matrix for each, saves confusion-matrix PNGs to `reports/`, and
-writes the higher-macro-F1 model to `models/best_pepper_model.joblib`.
+Trains a `RandomForestClassifier` and an `SVC`, reports **5-fold cross-validated**
+macro-F1 for each plus a hold-out `classification_report` and confusion matrix,
+saves confusion-matrix PNGs to `reports/`, runs the consistency check, refits the
+winner on all images, and writes it to `models/best_pepper_model.joblib`.
 
-Useful flags: `--model-out`, `--report-dir`, `--test-size`, `--random-state`.
+For the most stable model, train with photometric augmentation:
+
+```bash
+python bell_pepper_pipeline.py --data-dir data --augment --models RandomForest
+```
+
+`--augment` adds gamma, colour-cast, JPEG and blur variants of every training
+image so the classifier learns to ignore them. Augmented copies share a *group*
+with their source, and both the k-fold and the hold-out split are group-aware, so
+a variant of a training image can never land in the test set — that leakage would
+inflate the score without improving anything.
+
+`--models RandomForest` matters here: the RBF SVM scales roughly quadratically in
+sample count, and the augmented set is 7× larger, so including it turns a ~40
+minute run into a multi-hour one for an estimator that loses on this descriptor
+anyway.
+
+Useful flags: `--model-out`, `--report-dir`, `--test-size`, `--random-state`,
+`--cv-folds`, `--consistency-sample`, `--scan-only`.
 
 ---
 
@@ -176,26 +201,70 @@ python predict_pepper.py --image samples/bacterial_spot_leaf.jpg
 
 ---
 
-## Measured baseline results
+## Measured results
 
 Trained on the 2,475 PlantVillage bell-pepper images (1,478 healthy / 997
-bacterial spot), 80/20 stratified split → 495 held-out test images:
+bacterial spot).
 
-| Model | Accuracy | Macro-F1 |
-|---|---|---|
-| **SVM** (RBF, calibrated) — selected | **0.9960** | **0.9958** |
-| RandomForest | 0.9939 | 0.9937 |
+### Accuracy is not the interesting number
 
-RandomForest confusion matrix on the test split:
+Accuracy on a held-out split says nothing about whether the *same leaf*, shot a
+little differently, keeps its verdict. So alongside macro-F1 the pipeline
+measures **consistency**: each image is re-classified under 17 label-preserving
+transforms (rotation, flip, brightness, gamma, warm/cool colour cast, JPEG
+recompression, blur, centre-zoom), and the headline figure is the fraction of
+leaves whose verdict is identical across *all* of them.
 
-|  | Pred. Undamaged | Pred. Damaged |
-|---|---|---|
-| **True Undamaged** | 296 | 0 |
-| **True Damaged** | 3 | 196 |
+| Descriptor | Rows | CV macro-F1 | Fully stable | P(Damaged) spread |
+|---|---|---|---|---|
+| v1 whole-image (previous) | 2,475 | **0.9945** ± 0.0028 | 63.3% | 0.0987 |
+| v2 leaf-segmented | 2,475 | 0.9899 ± 0.0028 | 94.2% | 0.0374 |
+| **v2 + augmented** — shipped | 17,325 | 0.9883 ± 0.0032 | **96.7%** | **0.0242** |
 
-Both models are strongest at *not* false-alarming on healthy leaves; the few
-errors are missed bacterial-spot leaves. For a screening tool you likely want
-the opposite bias — see "Tuning" below.
+All three rows are measured on the **same 120-image sample with the same seed**,
+so they are directly comparable. The shipped bundle records its own figure from a
+larger 200-image sample — **98.5% stable, spread 0.0192** — which is why
+`models/best_pepper_model.joblib` reports a slightly better number than the
+comparison table above. Different sample, not a different model.
+
+The old model scored the *highest* macro-F1 while flipping its verdict on more
+than a third of leaves. That extra accuracy was the background shortcut, and it
+is exactly what made it fragile — so the 0.6-point F1 drop is the price of
+removing it, not a regression.
+
+### Where the instability was
+
+Verdict flip rate per transform (lower is better):
+
+| Transform | v1 | v2 | v2 + augmented |
+|---|---|---|---|
+| warm cast | 27.5% | 2.5% | 0.0% |
+| cool cast | 9.2% | 1.7% | 0.0% |
+| brightness ×0.75 | 2.5% | 0.0% | 0.0% |
+| gamma 0.75 | 0.8% | 1.7% | 0.0% |
+| JPEG q40 | 0.8% | 1.7% | 0.0% |
+| blur | 0.8% | 0.8% | 0.0% |
+| rotations / flips | 0.0% | ≤0.8% | ≤0.8% |
+| **zoom 0.85** *(held out)* | 0.8% | 3.3% | **2.5%** |
+| **JPEG q25** *(held out)* | 0.8% | 0.8% | **0.8%** |
+| **rot 17°** *(held out)* | 0.0% | 0.8% | **0.8%** |
+
+Two honest caveats on this table:
+
+- The trained transforms reaching exactly 0.0% is expected — the model was
+  trained on them. Read the **held-out** rows instead: `zoom_0.85`, `jpeg_q25`
+  and `rot17` are deliberately excluded from `AUGMENT_TRANSFORMS`, so they
+  measure generalised stability rather than memorised augmentation.
+- Segmentation introduced a *new* sensitivity of its own. Gamma and JPEG perturb
+  saturation, which shifts the Otsu mask, which moves the features — visible as
+  v2 getting slightly worse than v1 on `gamma_0.75` (0.8% → 1.7%) and
+  `zoom_0.85` (0.8% → 3.3%). Augmentation is what closes that back up. Framing
+  (`zoom_0.85`, 2.5%) is the largest remaining weakness.
+
+Class imbalance and error profile are unchanged: both models are strongest at
+*not* false-alarming on healthy leaves, and the few errors are missed
+bacterial-spot leaves. For a screening tool you likely want the opposite bias —
+see "Tuning" below.
 
 ### Tuning the healthy/damaged trade-off
 
@@ -212,20 +281,57 @@ label = 1 if proba > 0.35 else 0              # more sensitive than 0.5
 
 ## How it works
 
-Each image is reduced to one 1-D feature vector:
+Every image goes through the same four preprocessing steps before any feature is
+computed. The order matters and is enforced in one place (`preprocess()`) so
+training and inference cannot drift apart:
 
-1. **HSV color histogram** (16×16×16 bins, normalised) — HSV separates hue from
-   brightness, which makes the yellow-brown chlorotic halos of bacterial spot
-   far more separable than RGB.
+1. **Resize** to 256×256.
+2. **Segment the leaf** — Otsu's threshold on the *saturation* channel. Studio
+   backdrops are near-neutral (low saturation) while leaf tissue — green,
+   chlorotic yellow or necrotic brown alike — is saturated, so this separates the
+   two without a hue window that would exclude diseased tissue. Morphological
+   close/open removes speckle, components smaller than 15% of the largest are
+   dropped, and interior holes are filled so lesion centres stay inside the mask.
+3. **White balance** using the *background* as the neutral reference. Plain
+   grey-world assumes the whole frame averages to grey, which a leaf-filled frame
+   violates — it bleeds the leaf's own greenness into the correction. The
+   backdrop is genuinely neutral, so it makes a much better white reference.
+4. **Normalise exposure** so mean brightness *inside the mask* is fixed. Measuring
+   over leaf pixels only keeps a bright background from dragging the correction
+   around.
+
+Steps 2–4 must happen in that order: white-balancing first shifts the neutral
+backdrop off neutral, which hands the background saturation and shreds the mask.
+
+The masked image is then reduced to one 1-D feature vector:
+
+1. **HSV color histogram** (16×16×16 bins) — HSV separates hue from brightness,
+   which makes the yellow-brown chlorotic halos of bacterial spot far more
+   separable than RGB. L1-normalised to a distribution so the vector does not
+   depend on how many pixels the mask kept — a tight crop and a wide shot of the
+   same leaf land in the same place.
 2. **Local Binary Pattern histogram** (P=24, R=3, uniform) — captures the
    surface-roughness change caused by lesions and necrotic tissue.
+
+Both histograms count **only leaf pixels**. This is the main defence against the
+model keying on the backdrop rather than the leaf.
 
 Both are concatenated and fed to the classifiers. The SVM is wrapped in a
 `Pipeline` with `StandardScaler` so scaling is persisted with the model.
 
-Class imbalance is handled with `class_weight="balanced"`, and model selection
-uses **macro-F1** rather than accuracy so a skewed test set doesn't flatter the
-result.
+Class imbalance is handled with `class_weight="balanced"`. Model selection uses
+**5-fold cross-validated macro-F1** rather than a single split, because one
+80/20 partition is a sample of size one — rerun it with another seed and the
+headline number moves. The winner is then refit on all 2,475 images, since the
+split existed only to estimate performance.
+
+### Descriptor versioning
+
+The bundle records a `feature_version`. A model trained on an older descriptor
+would still *run* — the vector lengths can coincide — while silently scoring
+nonsense, because the bins no longer mean what it learned. `load_bundle()`
+refuses the mismatch instead, turning a silent accuracy collapse into a clear
+"retrain this" error.
 
 ---
 
@@ -234,11 +340,17 @@ result.
 - On PlantVillage alone, "Damaged" effectively means *bacterial spot*, since
   that is the only pepper disease class present. Add pest/deficiency folders
   (see `LABELS.md`) to broaden class 1 — no code change required.
-- **The 99% above is not field accuracy.** PlantVillage images are single
-  detached leaves shot against uniform grey backgrounds under even lighting.
-  HSV color histograms are a global descriptor, so the model is partly keying
-  on that consistent background. Expect a large drop on real greenhouse photos
-  with soil, multiple overlapping leaves, and variable sun.
+- **The 99% above is still not field accuracy.** Segmentation removes the
+  *background* shortcut, and the consistency numbers show the verdict now
+  survives lighting, colour and compression changes. Neither fact makes this a
+  field benchmark: every training image is a single detached leaf, centred and
+  in focus. Real greenhouse photos add soil, overlapping leaves, occlusion and
+  motion blur, and the saturation-Otsu mask in particular assumes a
+  low-saturation backdrop — on soil or foliage it will degrade. Expect a real
+  drop, just not the *background-shortcut* portion of it.
+- **Consistency is not correctness.** A model that answers "healthy" every time
+  would score 100% stable. Read the stability figure alongside macro-F1, never
+  instead of it.
 - **Bell pepper only.** There is no "not a pepper" class. Feed it a tomato,
   potato, or non-leaf image and it will still emit HEALTHY or DAMAGED with high
   apparent confidence. The output is meaningless outside *Capsicum annuum*.

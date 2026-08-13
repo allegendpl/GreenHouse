@@ -26,6 +26,7 @@ from bell_pepper_pipeline import (
     CLASS_DAMAGED,
     CLASS_NAMES,
     CLASS_UNDAMAGED,
+    FEATURE_VERSION,
     extract_features,
     load_image,
 )
@@ -37,13 +38,30 @@ VERDICT = {CLASS_UNDAMAGED: "HEALTHY", CLASS_DAMAGED: "DAMAGED"}
 
 
 def load_bundle(model_path: str = DEFAULT_MODEL_PATH) -> dict:
-    """Load the persisted model bundle, validating the path first."""
+    """
+    Load the persisted model bundle, validating the path and descriptor version.
+
+    A bundle trained on an older feature definition would still *run* — the
+    vector lengths can coincide — while quietly scoring nonsense, because the
+    bins no longer mean what the model learned. Refusing to load it turns a
+    silent accuracy collapse into an actionable error.
+    """
     if not os.path.isfile(model_path):
         raise FileNotFoundError(
             f"Model not found: {model_path!r}. Train one first:\n"
             f"  python bell_pepper_pipeline.py --data-dir data"
         )
-    return load(model_path)
+
+    bundle = load(model_path)
+
+    bundle_version = bundle.get("feature_version", 1)
+    if bundle_version != FEATURE_VERSION:
+        raise ValueError(
+            f"Model {model_path!r} was trained with feature version "
+            f"{bundle_version}, but this code produces version {FEATURE_VERSION}. "
+            f"Retrain it:\n  python bell_pepper_pipeline.py --data-dir data"
+        )
+    return bundle
 
 
 def predict_from_array(rgb: np.ndarray, bundle: dict) -> dict:
