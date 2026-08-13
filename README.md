@@ -2,13 +2,25 @@
 
 Can help farmers determine specifically what the type of damage is, and if this was an app it could then offer some solutions (i.e. which pesticide brand to buy)
 
-The repo currently holds two independent classifiers, one per crop. They do not
-share code or dependencies yet — pick the one you want to run.
+Both crops share **one** interface. Pick the crop in the sidebar:
 
-| Track | Crop | Approach | Entry point |
+```bash
+streamlit run app.py
+```
+
+| Crop | Species | Model | Predicts |
 |---|---|---|---|
-| **Tomato** | *Solanum lycopersicum* | Keras CNN, 10-class disease ID | `streamlit run app/app.py` |
-| **Bell pepper** | *Capsicum annuum* | scikit-learn + scikit-image, binary healthy/damaged | `streamlit run app.py` |
+| **Bell pepper** | *Capsicum annuum* | scikit-learn over HSV + LBP features | Healthy / Damaged |
+| **Tomato** | *Solanum lycopersicum* | Keras CNN, 224×224 | 10 specific conditions |
+
+The two models are entirely different underneath, so each crop supplies its own
+loader and predictor and both return the same result shape. Everything after
+that — the verdict banner, the probability breakdown, the image preview — is
+shared, which is what keeps it a single UI rather than two bolted together.
+
+Every prediction leads with the same **HEALTHY / DAMAGED** banner. For tomato the
+specific condition (early blight, leaf mold, …) appears directly beneath it, so
+one glance answers "is something wrong?" and the next line answers "what?".
 
 ---
 
@@ -24,14 +36,15 @@ A 10-class Keras CNN trained on a tomato-leaf dataset at 224×224, covering:
 |---|---|
 | `notebooks/plant_damage_classifier.ipynb` | Colab training notebook |
 | `app/tomato_model.keras` | Trained model loaded by the app |
-| `app/app.py` | Streamlit UI — upload a leaf, get top-3 predictions |
+
+Select **Tomato** in the sidebar of `app.py`. This half needs TensorFlow, which
+is deliberately **not** in `requirements.txt` — it is a very large dependency and
+the pepper half does not need it. `app.py` imports it lazily and shows an install
+prompt if you pick Tomato without it:
 
 ```bash
-streamlit run app/app.py
+pip install tensorflow
 ```
-
-Requires `tensorflow`, `streamlit`, `pillow`, `numpy`. Note this track is *not*
-covered by the root `requirements.txt`, which is pepper-only.
 
 ---
 
@@ -185,9 +198,10 @@ Useful flags: `--model-out`, `--report-dir`, `--test-size`, `--random-state`,
 streamlit run app.py
 ```
 
-Then open <http://localhost:8501>. The app runs **entirely locally** — bound to
-`127.0.0.1`, no tunnel (ngrok/Colab), no Deploy button, no telemetry. See
-`.streamlit/config.toml`. Dark theme is on by default.
+Then open <http://localhost:8501> and leave **Bell pepper** selected in the
+sidebar. The app runs **entirely locally** — bound to `127.0.0.1`, no tunnel
+(ngrok/Colab), no Deploy button, no telemetry. See `.streamlit/config.toml`.
+Dark theme is on by default.
 
 Two ways to supply an image:
 - **Upload** — drag and drop any JPG/PNG/BMP/TIF/WEBP from your machine.
